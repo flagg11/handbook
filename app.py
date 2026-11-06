@@ -342,6 +342,8 @@ def upload_file():
     if not file or file.filename == "":
         return _error("Файл не выбран")
     if not allowed_file(file.filename):
+        if file.filename.lower().endswith(".doc"):
+            return _error("Старый формат .doc не поддерживается: пересохраните файл как .docx")
         return _error("Разрешены только файлы PDF и Word (.docx)")
     if auto:
         folder = index.INBOX
@@ -592,6 +594,8 @@ def status():
         "rev": storage.rev,
         "scanning": storage.state["scanning"],
         "storage_error": storage.state["error"],
+        "legacy_doc": len(storage.state["legacy"]),
+        "legacy_examples": storage.state["legacy"][:5],
         "usage": storage.usage(),
         "root": cfg["root"] if storage.active() else "",
     })

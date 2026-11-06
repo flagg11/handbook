@@ -1778,7 +1778,13 @@ async function pollStatus() {
   const u = s.usage || {};
   const fill = $('#stFill'), txt = $('#stText'), path = $('#stPath');
   if (fill && u.total) fill.style.width = Math.min(100, Math.max(1, 100 * (u.total - u.free) / u.total)) + '%';
-  if (txt) txt.textContent = `Документы: ${fmtBytes(u.used)} · свободно на диске ${fmtBytes(u.free)}`;
+  const legacy = s.legacy_doc || 0;
+  if (txt) {
+    txt.textContent = `Документы: ${fmtBytes(u.used)} · свободно на диске ${fmtBytes(u.free)}` + (legacy ? ` · .doc пропущено: ${legacy}` : '');
+    txt.title = legacy ? `Старый формат .doc не читается, пересохраните как .docx:\n${(s.legacy_examples || []).join('\n')}${legacy > 5 ? '\n...' : ''}` : '';
+  }
+  if (legacy && legacy !== state.lastLegacy) toast(`Файлов .doc пропущено: ${legacy}. Пересохраните их как .docx`, true);
+  state.lastLegacy = legacy;
   if (path) path.textContent = s.root || '';
   if (s.storage_error && s.storage_error !== state.lastStErr) toast(s.storage_error, true);
   state.lastStErr = s.storage_error;

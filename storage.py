@@ -28,7 +28,7 @@ _cfg_lock = threading.Lock()
 _sync_lock = threading.Lock()
 _cfg = None
 rev = 0  # растёт при любом изменении файлов, по нему фронт обновляется
-state = {"scanning": False, "last_scan": None, "error": ""}
+state = {"scanning": False, "last_scan": None, "error": "", "legacy": []}
 
 
 # настройки
@@ -240,7 +240,7 @@ def probe(path):
 # сканирование диска
 def _walk(base):
     # недоступное (обрыв сети, нет прав) не считаем удалённым, иначе при сбое сети индекс опустеет
-    dirs, files, failed = {}, {}, set()
+    dirs, files, failed, legacy = {}, {}, set(), []
     stack = [("", base)]
     while stack:
         rel, path = stack.pop()
@@ -261,12 +261,14 @@ def _walk(base):
                 elif e.is_file(follow_symlinks=False) and is_doc(name):  # ссылки на файлы снаружи не читаем
                     st = e.stat()
                     files[crel] = (e.path, st.st_size, st.st_mtime)
+                elif name.lower().endswith(".doc") and not name.startswith("~$") and e.is_file(follow_symlinks=False):
+                    legacy.append(crel)  # старый .doc не читаем, но запоминаем чтобы предупредить
             except OSError:
                 failed.add(rel)
                 continue
         if len(files) > MAX_FILES:
             break
-    return dirs, files, failed
+    return dirs, files, failed, legacy
 
 
 def ensure_inbox():
@@ -303,7 +305,8 @@ def sync(submit):
             state["error"] = ""
             if cfg["auto_sort"]:
                 ensure_inbox()
-            dirs, files, failed = _walk(base)
+            dirs, files, failed, legacy = _walk(base)
+            state["legacy"] = sorted(legacy)
             if "" in failed:
                 state["error"] = "Не удаётся прочитать папку хранилища: " + base
                 return False
