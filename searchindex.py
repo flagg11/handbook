@@ -87,7 +87,9 @@ def init_db():
         cols = [r[1] for r in con.execute("PRAGMA table_info(chunks)")]
         if "geom" not in cols:  # база от старой версии (без геометрии таблиц)
             con.execute("ALTER TABLE chunks ADD COLUMN geom TEXT")
-        for table, col, decl in (("folders", "rel", "TEXT"), ("docs", "rel", "TEXT"), ("docs", "mtime", "REAL")):
+        for table, col, decl in (("folders", "rel", "TEXT"), ("docs", "rel", "TEXT"), ("docs", "mtime", "REAL"),
+                                 ("docs", "sha256", "TEXT"), ("docs", "valid_until", "TEXT"), ("docs", "review_until", "TEXT"),
+                                 ("docs", "superseded_by", "TEXT"), ("docs", "edition", "TEXT")):
             if col not in [r[1] for r in con.execute(f"PRAGMA table_info({table})")]:  # база до режима с подключённой папкой
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         con.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -260,6 +262,113 @@ def add_document(doc_id, folder, name, path, size_bytes, author, date_label=None
         )
 
 
+# дубли, сроки действия, редакции
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+SOON_DAYS = 30  # за сколько дней до срока документ помечается как «скоро истекает»
+
+
+def set_hash(doc_id, digest):
+    with connect() as con:
+        con.execute("UPDATE docs SET sha256=? WHERE id=?", (digest, doc_id))
+
+
+def docs_without_hash():
+    with connect() as con:
+        return [dict(r) for r in con.execute("SELECT id, path FROM docs WHERE sha256 IS NULL OR sha256=''")]
+
+
+def find_by_hash(digest, exclude=None):
+    """самый ранний документ с таким же содержимым файла"""
+    with connect() as con:
+        row = con.execute("SELECT * FROM docs WHERE sha256=? AND id<>? ORDER BY uploaded_at, rowid LIMIT 1",
+                          (digest, exclude or "")).fetchone()
+    return dict(row) if row else None
+
+
+def relations():
+    """связи между документами: дубли (по содержимому файла) и «кто кого заменил»"""
+    with connect() as con:
+        rows = con.execute("SELECT id, name, sha256, superseded_by FROM docs ORDER BY uploaded_at, rowid").fetchall()
+    first, dup, replaces = {}, {}, {}
+    for r in rows:
+        if r["sha256"]:
+            if r["sha256"] in first:
+                dup[r["id"]] = {"id": first[r["sha256"]]["id"], "name": first[r["sha256"]]["name"]}
+            else:
+                first[r["sha256"]] = r
+        if r["superseded_by"]:
+            replaces[r["superseded_by"]] = r["id"]
+    return {"dup": dup, "replaces": replaces, "names": {r["id"]: r["name"] for r in rows}}
+
+
+def _clean_date(value):
+    value = (value or "").strip()
+    if not value:
+        return None
+    if not _DATE_RE.match(value):
+        raise ValueError("Дата должна быть в формате ГГГГ-ММ-ДД")
+    try:
+        time.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError("Такой даты не существует")
+    return value
+
+
+def set_doc_terms(doc_id, **fields):
+    """сроки и редакция; пустое значение очищает поле"""
+    cols = {}
+    if "valid_until" in fields:
+        cols["valid_until"] = _clean_date(fields["valid_until"])
+    if "review_until" in fields:
+        cols["review_until"] = _clean_date(fields["review_until"])
+    if "edition" in fields:
+        cols["edition"] = (fields["edition"] or "").strip()[:80] or None
+    if not cols:
+        return
+    with connect() as con:
+        if con.execute("SELECT 1 FROM docs WHERE id=?", (doc_id,)).fetchone() is None:
+            raise LookupError("Файл не найден")
+        con.execute("UPDATE docs SET " + ", ".join(f"{k}=?" for k in cols) + " WHERE id=?", (*cols.values(), doc_id))
+
+
+def term_state(d, today=None):
+    """состояние сроков документа: valid - 'expired' | 'soon' | 'ok' | '', review - 'overdue' | 'soon' | 'ok' | ''"""
+    today = today or time.strftime("%Y-%m-%d")
+    t0 = time.mktime(time.strptime(today, "%Y-%m-%d"))
+    out = {}
+    for key, bad in (("valid", "expired"), ("review", "overdue")):
+        value = d.get(key + "_until")
+        if not value:
+            out[key + "_state"], out[key + "_days"] = "", None
+            continue
+        days = round((time.mktime(time.strptime(value, "%Y-%m-%d")) - t0) / 86400)
+        out[key + "_days"] = days
+        out[key + "_state"] = bad if days < 0 else ("soon" if days <= SOON_DAYS else "ok")
+    return out
+
+
+def supersede(old_id, new_id):
+    """old_id заменён редакцией new_id: из поиска он пропадает, пока отметку не снимут"""
+    if old_id == new_id:
+        raise ValueError("Файл не может заменять сам себя")
+    with connect() as con:
+        for i in (old_id, new_id):
+            if con.execute("SELECT 1 FROM docs WHERE id=?", (i,)).fetchone() is None:
+                raise LookupError("Файл не найден")
+        cur = new_id  # цепочка замен не должна замыкаться в кольцо
+        while cur:
+            if cur == old_id:
+                raise ValueError("Так получится замкнутая цепочка редакций")
+            row = con.execute("SELECT superseded_by FROM docs WHERE id=?", (cur,)).fetchone()
+            cur = row["superseded_by"] if row else None
+        con.execute("UPDATE docs SET superseded_by=? WHERE id=?", (new_id, old_id))
+
+
+def clear_supersede(doc_id):
+    with connect() as con:
+        con.execute("UPDATE docs SET superseded_by=NULL WHERE id=?", (doc_id,))
+
+
 def get_document(doc_id):
     with connect() as con:
         row = con.execute("SELECT * FROM docs WHERE id=?", (doc_id,)).fetchone()
@@ -346,6 +455,7 @@ def _drop_chunks(con, doc_id):
 
 
 def _drop_doc_rows(con, doc_id):
+    con.execute("UPDATE docs SET superseded_by=NULL WHERE superseded_by=?", (doc_id,))  # заменявший файл удалён - прежний снова актуален
     _drop_chunks(con, doc_id)
     con.execute("DELETE FROM pages WHERE doc_id=?", (doc_id,))
     con.execute("DELETE FROM docs WHERE id=?", (doc_id,))
@@ -387,6 +497,7 @@ def _rescale_geom(raw, n_rows):
 
 
 def update_chunk(chunk_id, text=None, rows=None):
+    bump_vocab()
     with _lock, connect() as con:
         row = con.execute("SELECT * FROM chunks WHERE id=?", (chunk_id,)).fetchone()
         if not row:
@@ -600,7 +711,244 @@ def _phrase_bonus(text, q_stems):
     return 0.0
 
 
-def search(query, limit=20, per_doc=3, folder=None):
+
+# ---- исправление опечаток и неверной раскладки ----
+# Словарь - это все основы слов из самого индекса (плюс слова из названий файлов и папок), отдельного файла нет.
+# Исправление включается только для слов, которых в индексе нет, поэтому правильные запросы идут как раньше.
+_vocab_gen = 0
+_vocab_lock = threading.Lock()
+_vocab = {"sig": None, "built": 0.0, "freq": {}, "by_len": {}, "keys": [], "surface": {}}
+
+_RU = "йцукенгшщзхъфывапролджэячсмитьбюё"
+_EN = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`"
+_EN2RU = {ord(e): r for e, r in zip(_EN, _RU)}
+_EN2RU.update({ord(e.upper()): r.upper() for e, r in zip("qwertyuiopasdfghjklzxcvbnm", "йцукенгшщзфывапролдячсмить")})
+_EN2RU.update({ord("{"): "Х", ord("}"): "Ъ", ord(":"): "Ж", ord('"'): "Э", ord("<"): "Б", ord(">"): "Ю", ord("~"): "Ё"})
+_RU_LETTER_KEYS = "йцукенгшщзфывапролдячсмить"  # буквы, которым на латинской раскладке тоже соответствуют буквы
+_RU2EN = {ord(r): e for r, e in zip(_RU, _EN) if r in _RU_LETTER_KEYS}
+_RU2EN.update({ord(r.upper()): e.upper() for r, e in zip(_RU, _EN) if r in _RU_LETTER_KEYS})
+_LAT_TOKEN = re.compile(r"[\[\];',.`]*[A-Za-z](?:[A-Za-z\[\];',.`]*[A-Za-z])?[\[\];',.`]*")
+_CYR_TOKEN = re.compile(r"[А-Яа-я]+")
+_TYPO_MIN_LEN = 4
+
+
+def bump_vocab():
+    global _vocab_gen
+    _vocab_gen += 1
+
+
+def _vocab_sig(con):
+    c = con.execute("SELECT count(*), coalesce(max(id), 0) FROM chunks").fetchone()
+    d = con.execute("SELECT count(*), coalesce(sum(length(name)), 0) FROM docs WHERE status='indexed'").fetchone()
+    f = con.execute("SELECT count(*), coalesce(sum(length(name)), 0) FROM folders").fetchone()
+    return (_vocab_gen, tuple(c), tuple(d), tuple(f))
+
+
+def _get_vocab():
+    """словарь основ слов: {основа: в скольких блоках встречается}; пересобирается, если индекс изменился"""
+    with connect() as con:
+        sig = _vocab_sig(con)
+        if _vocab["sig"] == sig and time.time() - _vocab["built"] < 300:
+            return _vocab
+        with _vocab_lock:
+            if _vocab["sig"] == sig and time.time() - _vocab["built"] < 300:
+                return _vocab
+            con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS temp.chunks_vocab USING fts5vocab(main, chunks_fts, 'row')")
+            freq = {t: n for t, n in con.execute("SELECT term, doc FROM temp.chunks_vocab")}
+            surface = {}
+            names = [r[0].rsplit(".", 1)[0] for r in con.execute("SELECT name FROM docs WHERE status='indexed'")]
+            names += [r[0] for r in con.execute("SELECT name FROM folders")]
+            for nm in names:
+                for w in WORD_RE.findall(nm):
+                    st = stem(w)
+                    freq[st] = freq.get(st, 0) + 1
+                    surface.setdefault(st, w.lower())
+            by_len = {}
+            for t, n in freq.items():
+                if len(t) >= _TYPO_MIN_LEN - 1 and not t.isdigit():
+                    by_len.setdefault(len(t), []).append((t, frozenset(t), n))
+            _vocab.update(sig=sig, built=time.time(), freq=freq, by_len=by_len,
+                          keys=sorted(freq), surface=surface)
+    return _vocab
+
+
+def _known(v, st):
+    """основа есть в индексе (так же, как её найдёт поиск: по префиксу от 3 знаков)"""
+    if st in v["freq"]:
+        return True
+    if len(st) < 3:
+        return False
+    import bisect
+    keys = v["keys"]
+    i = bisect.bisect_left(keys, st)
+    return i < len(keys) and keys[i].startswith(st)
+
+
+def _osa(a, b, k):
+    """расстояние Дамерау - Левенштейна (перестановка соседних букв = 1 ошибка); больше k - возвращает k + 1"""
+    la, lb = len(a), len(b)
+    if abs(la - lb) > k:
+        return k + 1
+    prev2, prev = None, list(range(lb + 1))
+    for i in range(1, la + 1):
+        cur = [i] + [0] * lb
+        best = cur[0]
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            val = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            if prev2 is not None and i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                val = min(val, prev2[j - 2] + 1)
+            cur[j] = val
+            if val < best:
+                best = val
+        if best > k:
+            return k + 1
+        prev2, prev = prev, cur
+    return prev[lb]
+
+
+def _nearest(v, st):
+    """ближайшая к st основа из индекса или None; правка - одна ошибка, для длинных слов - две"""
+    k = 1 if len(st) <= 7 else 2
+    sa = frozenset(st)
+    best = None
+    for ln in range(len(st) - k, len(st) + k + 1):
+        for t, sb, n in v["by_len"].get(ln, ()):
+            if len(sa - sb) > k or len(sb - sa) > k:
+                continue
+            d = _osa(st, t, k)
+            if d > k:
+                continue
+            key = (d, t[0] != st[0], -n)
+            if best is None or key < best[0]:
+                best = (key, t)
+    return best[1] if best else None
+
+
+def _surface_word(v, st, like):
+    """читаемое слово для основы: самая частая форма из текстов; если нет - основа как есть"""
+    w = v["surface"].get(st)
+    if w is None:
+        cnt = {}
+        with connect() as con:
+            try:
+                rows = con.execute("SELECT c.text FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid "
+                                   "WHERE chunks_fts MATCH ? LIMIT 8", (f'"{st}"',)).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+        for r in rows:
+            for m in WORD_RE.findall(r[0]):
+                if stem(m) == st:
+                    cnt[m.lower()] = cnt.get(m.lower(), 0) + 1
+        w = max(cnt, key=cnt.get) if cnt else st
+        v["surface"][st] = w
+    if like.isupper() and len(like) > 1:
+        return w.upper()
+    if like[:1].isupper():
+        return w[:1].upper() + w[1:]
+    return w
+
+
+def _layout_swap(word):
+    """слово, набранное не в той раскладке; None, если перевод не нужен"""
+    if _LAT_TOKEN.fullmatch(word):
+        out = word.translate(_EN2RU)
+    elif _CYR_TOKEN.fullmatch(word):
+        out = word.translate(_RU2EN)
+    else:
+        return None
+    return out if out != word else None
+
+
+def _fix_query(query):
+    """возвращает {"query": исправленный запрос, "kind": "layout"|"typo"|"both"} или None"""
+    if SECTION_RE.match(query.strip()):
+        return None
+    v = _get_vocab()
+    if not v["freq"]:
+        return None
+    parts = re.split(r"(\s+)", query.strip())
+    used_layout = used_typo = False
+    out = []
+    for part in parts:
+        if not part or part.isspace():
+            out.append(part)
+            continue
+        words = WORD_RE.findall(part)
+        if not words or all(w.lower() in STOP for w in words):
+            out.append(part)
+            continue
+        if all(_known(v, stem(w)) for w in words if w.lower() not in STOP):
+            out.append(part)
+            continue
+        # 1) раскладка: переводим кусок целиком (в нём могут быть знаки «,» «.» из букв б, ю)
+        fixed = None
+        for cand in (part, part.strip(".,;:!?()\"")):
+            sw = _layout_swap(cand) if len(cand) >= 2 else None
+            ws = [w for w in WORD_RE.findall(sw) if w.lower() not in STOP] if sw else []
+            if ws and all(_known(v, stem(w)) for w in ws):
+                fixed = sw
+                break
+        if fixed:
+            out.append(fixed)
+            used_layout = True
+            continue
+        # 2) опечатки: по словам, у которых нет основы в индексе
+        pieces, changed = [], False
+        pos = 0
+        for m in WORD_RE.finditer(part):
+            w = m.group()
+            pieces.append(part[pos:m.start()])
+            pos = m.end()
+            st = stem(w)
+            if (w.lower() in STOP or len(w) < _TYPO_MIN_LEN or any(ch.isdigit() for ch in w) or _known(v, st)):
+                pieces.append(w)
+                continue
+            near = _nearest(v, st)
+            if near:
+                pieces.append(_surface_word(v, near, w))
+                changed = True
+            else:
+                pieces.append(w)
+        pieces.append(part[pos:])
+        out.append("".join(pieces))
+        used_typo = used_typo or changed
+    new = "".join(out)
+    if new == query.strip() or not (used_layout or used_typo):
+        return None
+    return {"query": new, "kind": "both" if used_layout and used_typo else ("layout" if used_layout else "typo")}
+
+
+def search(query, limit=20, per_doc=3, folder=None, fix=True, old=False):
+    """поиск; если в запросе есть слова, которых нет в индексе, пробует исправить опечатку или раскладку"""
+    res = _search_core(query, limit, per_doc, folder, old)
+    q = (query or "").strip()
+    if fix and q:
+        try:
+            fx = _fix_query(q)
+        except Exception:  # исправление - только подсказка, на поиск оно влиять не должно
+            fx = None
+        if fx:
+            res2 = _search_core(fx["query"], limit, per_doc, folder, old)
+            if _clearly_better(res, res2):
+                res2["corrected"] = {"query": fx["query"], "original": q, "kind": fx["kind"]}
+                return res2
+    return res
+
+
+def _clearly_better(orig, fixed):
+    """исправленный запрос подменяет исходный, только если он заметно лучше:
+    исходный ничего не нашёл, либо исправленный выводит другой документ первым и с заметно большим весом"""
+    if not fixed["results"]:
+        return not orig["results"] and bool(fixed.get("folders")) and not orig.get("folders")
+    if not orig["results"]:
+        return True
+    if fixed["results"][0]["doc_id"] == orig["results"][0]["doc_id"]:
+        return False  # нужный документ человек и так видит первым
+    return fixed["results"][0]["score"] >= orig["results"][0]["score"] + 2.0
+
+
+def _search_core(query, limit=20, per_doc=3, folder=None, include_old=False):
     query = (query or "").strip()
     if not query:
         return {"query": query, "total": 0, "results": []}
@@ -612,6 +960,8 @@ def search(query, limit=20, per_doc=3, folder=None):
 
     with connect() as con:
         docs = {r["id"]: dict(r) for r in con.execute("SELECT * FROM docs WHERE status='indexed'")}
+        if not include_old:
+            docs = {k: v for k, v in docs.items() if not v.get("superseded_by")}
         if allowed is not None:
             docs = {k: v for k, v in docs.items() if v["folder"] in allowed}
 
@@ -630,6 +980,8 @@ def search(query, limit=20, per_doc=3, folder=None):
                 "section": row["section"], "parent": row["parent"], "title": row["title"],
                 "page": row["page"], "page_to": row["page_to"], "source": row["source"], "chunk_kind": row["kind"],
                 "kind": kind, "score": round(score, 3), "snippet": snippet,
+                "valid_until": d.get("valid_until"), "review_until": d.get("review_until"), "edition": d.get("edition"),
+                "superseded": bool(d.get("superseded_by")), "term": term_state(d),
             })
 
         # запрос - номер пункта («2.5.2.2»)
@@ -658,6 +1010,8 @@ def search(query, limit=20, per_doc=3, folder=None):
                             "folder_path": folder_path(d["folder"], fmap), "section": "", "parent": "", "title": "",
                             "page": 1, "page_to": 1, "source": "empty", "chunk_kind": "text",
                             "kind": "name", "score": 7, "snippet": "Документ без распознанного текста (скан)",
+                            "valid_until": d.get("valid_until"), "review_until": d.get("review_until"), "edition": d.get("edition"),
+                            "superseded": bool(d.get("superseded_by")), "term": term_state(d),
                         })
 
             # полнотекст: сначала все слова (AND), потом любое (OR)

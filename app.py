@@ -1,5 +1,6 @@
 import json
 import os
+import hashlib
 import hmac
 import re
 import shutil
@@ -83,8 +84,32 @@ def human_size(num_bytes):
         size /= 1024
 
 
-def doc_to_json(d):
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _sha256_stream(stream):
+    h = hashlib.sha256()
+    for block in iter(lambda: stream.read(1 << 20), b""):
+        h.update(block)
+    stream.seek(0)
+    return h.hexdigest()
+
+
+def doc_to_json(d, rel=None):
+    rel = rel or index.relations()
+    sup_by = d.get("superseded_by") or None
+    old_id = rel["replaces"].get(d["id"])
     return {
+        "valid_until": d.get("valid_until"), "review_until": d.get("review_until"), "edition": d.get("edition") or "",
+        "term": index.term_state(d),
+        "superseded_by": sup_by, "superseded_by_name": rel["names"].get(sup_by) if sup_by else None,
+        "replaces": old_id, "replaces_name": rel["names"].get(old_id) if old_id else None,
+        "dup_of": rel["dup"].get(d["id"]),
         "id": d["id"], "folder": d["folder"], "name": d["name"],
         "size": human_size(d["size_bytes"]), "date": d["date_label"], "author": d["author"],
         "status": d["status"], "pages": d["pages"], "ocr_pages": d["ocr_pages"], "tables": d["tables"],
@@ -175,6 +200,10 @@ def ingest(doc_id):
     if not doc:
         return
     try:
+        try:
+            index.set_hash(doc_id, _sha256_file(doc["path"]))
+        except OSError:
+            pass
         result = docparse.parse_pdf(pdf_path(doc))
         classify.forget(doc_id)
         shutil.rmtree(os.path.join(PAGES_DIR, doc_id), ignore_errors=True)
@@ -223,6 +252,15 @@ def activate():
         storage.start_scanner(submit_ingest)
 
 
+def _backfill_hashes():
+    """файлы, добавленные до появления проверки дублей, получают отпечаток в фоне"""
+    for d in index.docs_without_hash():
+        try:
+            index.set_hash(d["id"], _sha256_file(d["path"]))
+        except OSError:
+            continue
+
+
 def boot_once():
     global _booted
     with _boot_lock:
@@ -231,6 +269,7 @@ def boot_once():
         index.init_db()
         activate()
         _booted = True
+        threading.Thread(target=_backfill_hashes, daemon=True).start()
 
 
 OPEN_PREFIXES = ("/static/", "/api/config", "/api/setup", "/api/fs/")
@@ -330,7 +369,8 @@ def folders_delete(fid):
 # документы
 @app.route("/api/uploads", methods=["GET"])
 def list_uploads():
-    return jsonify([doc_to_json(d) for d in index.list_documents()])
+    rel = index.relations()
+    return jsonify([doc_to_json(d, rel) for d in index.list_documents()])
 
 
 @app.route("/api/upload", methods=["POST"])
@@ -349,11 +389,19 @@ def upload_file():
         folder = index.INBOX
     elif not folder or not index.get_folder(folder):
         return _error("Папка для загрузки не найдена")
+    digest = _sha256_stream(file.stream)
+    if request.form.get("dup") != "keep":
+        found = index.find_by_hash(digest)
+        if found:
+            return jsonify({"error": f"Такой файл уже есть: «{found['name']}»",
+                            "duplicate": {"id": found["id"], "name": found["name"], "folder": found["folder"],
+                                          "folder_path": index.folder_path(found["folder"]), "status": found["status"]}}), 409
     if storage.active():
         try:
             doc_id = storage.save_upload(file, folder, want_sort=auto, validate=_valid_upload)
         except (ValueError, LookupError) as exc:
             return _error(str(exc))
+        index.set_hash(doc_id, digest)
         submit_ingest(doc_id)
         return jsonify(doc_to_json(index.get_document(doc_id))), 201
 
@@ -369,6 +417,7 @@ def upload_file():
         return _error("Файл повреждён или его содержимое не соответствует формату " + ext.lstrip(".").upper())
 
     index.add_document(doc_id, folder, display_name, dest, os.path.getsize(dest), "Вы", want_sort=auto)
+    index.set_hash(doc_id, digest)
     submit_ingest(doc_id)
     return jsonify(doc_to_json(index.get_document(doc_id))), 201
 
@@ -379,13 +428,38 @@ def doc_update(doc_id):
     if doc is None:
         return _error("Файл не найден", 404)
     data = request.get_json(silent=True) or {}
+    terms = {k: data[k] for k in ("valid_until", "review_until", "edition") if k in data}
     try:
+        if terms:
+            index.set_doc_terms(doc_id, **terms)
         if data.get("name") is not None:
             (storage.rename_doc if storage.active() else index.rename_document)(doc_id, data["name"])
         if data.get("folder"):
             (storage.move_doc if storage.active() else index.move_document)(doc_id, data["folder"])  # ручной перенос снимает пометки автосортировки
     except (ValueError, LookupError) as exc:
         return _error(str(exc))
+    return jsonify(doc_to_json(index.get_document(doc_id)))
+
+
+@app.route("/api/docs/<doc_id>/supersede", methods=["POST"])
+def doc_supersede(doc_id):
+    """файл doc_id заменён новой редакцией (id в поле by): из поиска он пропадает, сам файл не трогаем"""
+    old = index.get_document(doc_id)
+    new = index.get_document((request.get_json(silent=True) or {}).get("by") or "")
+    if old is None or new is None:
+        return _error("Файл не найден", 404)
+    try:
+        index.supersede(doc_id, new["id"])
+    except (ValueError, LookupError) as exc:
+        return _error(str(exc))
+    return jsonify(doc_to_json(index.get_document(doc_id)))
+
+
+@app.route("/api/docs/<doc_id>/supersede", methods=["DELETE"])
+def doc_unsupersede(doc_id):
+    if index.get_document(doc_id) is None:
+        return _error("Файл не найден", 404)
+    index.clear_supersede(doc_id)
     return jsonify(doc_to_json(index.get_document(doc_id)))
 
 
@@ -580,7 +654,7 @@ def doc_page_image(doc_id, page_no):
 def search():
     q = request.args.get("q", "")
     folder = request.args.get("folder") or None
-    return jsonify(index.search(q, limit=20, folder=folder))
+    return jsonify(index.search(q, limit=20, folder=folder, fix=request.args.get("fix") != "0", old=request.args.get("old") == "1"))
 
 
 @app.route("/api/status")

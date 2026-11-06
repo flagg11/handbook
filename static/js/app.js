@@ -32,7 +32,7 @@ async function api(method, url, body) {
   const res = await fetch(url, opt);
   let data = null;
   try { data = await res.json(); } catch { /* пустой ответ - не беда */ }
-  if (!res.ok) throw new Error((data && data.error) || `Ошибка ${res.status}`);
+  if (!res.ok) { const err = new Error((data && data.error) || `Ошибка ${res.status}`); err.data = data; throw err; }
   return data;
 }
 
@@ -45,6 +45,8 @@ function toast(msg, isErr = false) {
 }
 
 const ICON = {
+  cal: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none"><rect x="4" y="5.5" width="16" height="14" rx="2.2" stroke="currentColor" stroke-width="1.6"/><path d="M4 10h16M8.5 3.5v4M15.5 3.5v4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
+  rev: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M7 3.5h7l4 4V20a.5.5 0 0 1-.5.5h-10.5a.5.5 0 0 1-.5-.5V4a.5.5 0 0 1 .5-.5z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 17v-6m0 0l-2.4 2.4M12 11l2.4 2.4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   folder: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M3.5 7.2c0-1.5 1.2-2.7 2.7-2.7h3.6c.6 0 1.1.2 1.5.6l1.2 1.1h5.3c1.5 0 2.7 1.2 2.7 2.7v7.4c0 1.5-1.2 2.7-2.7 2.7H6.2c-1.5 0-2.7-1.2-2.7-2.7V7.2z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>',
   inbox: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M4 13l2-7h12l2 7v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-5zM4 13h4.5l1 2h5l1-2H20" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>',
   home: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M4 11l8-6.5 8 6.5v8a1 1 0 0 1-1 1h-4v-6H9v6H5a1 1 0 0 1-1-1v-8z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>',
@@ -254,6 +256,7 @@ function toggleExpand(id) {
 
 function navigate(id) {
   state.cur = id;
+  state.attention = false;
   for (const f of pathOf(id).slice(0, -1)) state.expanded.add(f.id);
   if (childrenOf(id).length) state.expanded.add(id);
   store.set('expanded', [...state.expanded]);
@@ -280,8 +283,9 @@ function renderMain() {
   }
   $('#sortInboxBtn').hidden = state.cur !== INBOX || !docsIn(INBOX).some((d) => d.status === 'indexed');
 
-  const subs = childrenOf(state.cur === ROOT ? null : state.cur);
-  const docs = state.cur === ROOT ? [] : docsIn(state.cur);
+  const att = !!state.attention;
+  const subs = att ? [] : childrenOf(state.cur === ROOT ? null : state.cur);
+  const docs = att ? state.docs.filter(needsAttention) : (state.cur === ROOT ? [] : docsIn(state.cur));
   const pending = state.docs.filter((d) => d.status === 'processing').length;
   const review = state.docs.filter((d) => d.needs_review).length;
   const info = $('#toolbarInfo');
@@ -289,10 +293,17 @@ function renderMain() {
   info.append(`Папок: ${subs.length} · файлов: ${docs.length}`);
   if (pending) info.appendChild(el('span', { class: 'chip chip-ocr' }, `<span class="spinner"></span> обрабатывается: ${pending}`));
   if (review) info.appendChild(el('span', { class: 'chip chip-warn', title: 'Файлы, которые автосортировка не смогла уверенно определить' }, `требуют проверки: ${review}`));
+  const nAtt = state.docs.filter(needsAttention).length;
+  if (nAtt || att) {
+    const b = el('button', { class: 'chip chip-warn', type: 'button', title: 'Файлы, у которых срок действия или пересмотр истекли либо скоро истекут' },
+      att ? 'показаны только файлы со сроками · показать все' : `сроки: ${nAtt}`);
+    b.onclick = () => { state.attention = !state.attention; render(); };
+    info.appendChild(b);
+  }
 
   const rows = $('#fileRows'); rows.innerHTML = '';
   if (!subs.length && !docs.length) {
-    rows.appendChild(el('div', { class: 'empty' }, state.cur === ROOT ? '<b>Здесь пока пусто</b>Перетащите PDF в окно или нажмите «Загрузить».' :
+    rows.appendChild(el('div', { class: 'empty' }, att ? '<b>Нет файлов со сроками, требующими внимания</b>' : state.cur === ROOT ? '<b>Здесь пока пусто</b>Перетащите PDF в окно или нажмите «Загрузить».' :
       '<b>Папка пуста</b>Перетащите сюда файлы или нажмите «Загрузить».'));
     return;
   }
@@ -320,8 +331,29 @@ function folderRow(f) {
   return r;
 }
 
+const fmtDate = (iso) => (iso ? iso.split('-').reverse().join('.') : '');
+// пометки о редакции и сроках (для списка файлов и для выдачи поиска)
+function termChips(x) {
+  const out = [], t = x.term || {};
+  if (x.edition) out.push(`<span class="chip" title="Редакция">${esc(x.edition)}</span>`);
+  if (x.valid_until) {
+    const dt = fmtDate(x.valid_until);
+    if (t.valid_state === 'expired') out.push(`<span class="chip chip-bad" title="Срок действия истёк дней назад: ${-t.valid_days}">срок действия истёк · ${dt}</span>`);
+    else if (t.valid_state === 'soon') out.push(`<span class="chip chip-warn" title="Осталось дней: ${t.valid_days}">действует до ${dt}</span>`);
+    else out.push(`<span class="chip" title="Срок действия документа">действует до ${dt}</span>`);
+  }
+  if (x.review_until) {
+    const dt = fmtDate(x.review_until);
+    if (t.review_state === 'overdue') out.push(`<span class="chip chip-warn" title="Пересмотр просрочен на дней: ${-t.review_days}">пересмотр просрочен · ${dt}</span>`);
+    else if (t.review_state === 'soon') out.push(`<span class="chip chip-warn" title="До пересмотра дней: ${t.review_days}">пересмотр до ${dt}</span>`);
+    else out.push(`<span class="chip" title="Срок следующего пересмотра">пересмотр до ${dt}</span>`);
+  }
+  return out;
+}
+const needsAttention = (d) => !d.superseded_by && !!d.term && (['expired', 'soon'].includes(d.term.valid_state) || ['overdue', 'soon'].includes(d.term.review_state));
+
 function docRow(d) {
-  const r = el('div', { class: 'file-row', 'data-doc': d.id, draggable: 'true' });
+  const r = el('div', { class: 'file-row' + (d.superseded_by ? ' is-old' : ''), 'data-doc': d.id, draggable: 'true' });
   const chips = [];
   if (d.kind === 'docx') chips.push('<span class="chip" title="Документ Word: читается через преобразование в страницы">Word</span>');
   if (d.ocr_pages) chips.push(`<span class="chip chip-ocr" title="Страниц, распознанных через OCR: ${d.ocr_pages}">OCR</span>`);
@@ -329,6 +361,10 @@ function docRow(d) {
   if (d.auto && d.folder !== INBOX && !d.needs_review) chips.push(`<span class="chip chip-ok" title="${esc(d.reason)}">автосортировка · ${Math.round(d.confidence * 100)}%</span>`);
   if (d.needs_review) chips.push(`<button class="chip chip-warn" type="button" data-review title="${esc(d.reason)}">проверить${d.confidence ? ' · ' + Math.round(d.confidence * 100) + '%' : ''}</button>`);
   if (d.warnings.length) chips.push(`<span class="chip chip-warn" title="${esc(d.warnings.join('\n'))}">предупреждение</span>`);
+  chips.push(...termChips(d));
+  if (d.superseded_by) chips.push(`<button class="chip chip-warn" type="button" data-new title="Открыть актуальную редакцию">заменён: ${esc(d.superseded_by_name || '')}</button>`);
+  if (d.replaces) chips.push(`<span class="chip chip-ok" title="Эта редакция заменила предыдущую">заменяет: ${esc(d.replaces_name || '')}</span>`);
+  if (d.dup_of) chips.push(`<button class="chip chip-warn" type="button" data-dup title="Содержимое файла полностью совпадает с другим файлом">дубль: ${esc(d.dup_of.name)}</button>`);
   let status = `${d.pages || '—'} стр.`;
   if (d.status === 'processing' || d.status === 'queued') status = '<span class="spinner"></span> Обработка…';
   else if (d.status === 'error') status = `<span class="chip chip-bad" title="${esc(d.error)}">ошибка</span>`;
@@ -336,10 +372,16 @@ function docRow(d) {
     <div class="fr-text"><div class="fr-name" title="${esc(d.name)}">${esc(d.name)}</div><div class="fr-sub">${chips.join('')}</div></div></div>
     <div class="col-type">${status}</div><div class="col-size">${esc(d.size)}</div><div class="col-date">${esc(d.date)}</div><div class="col-actions"></div>`;
   const act = $('.col-actions', r);
-  act.append(iconBtn(ICON.redo, 'Перераспознать', () => reparseDocRow(d)),
+  act.append(iconBtn(ICON.cal, 'Сроки действия и редакция', () => openTerms(d)),
+    iconBtn(ICON.rev, 'Загрузить новую редакцию', () => newEdition(d)),
+    iconBtn(ICON.redo, 'Перераспознать', () => reparseDocRow(d)),
     iconBtn(ICON.move, 'Переместить', () => moveDocDialog(d)),
     iconBtn(ICON.edit, 'Переименовать', () => renameDoc(d)),
     iconBtn(ICON.trash, 'Удалить', () => deleteDoc(d)));
+  const nw = $('[data-new]', r);
+  if (nw) nw.onclick = (e) => { e.stopPropagation(); const t = state.docs.find((x) => x.id === d.superseded_by); if (t) { navigate(t.folder); if (t.status === 'indexed') openViewer(t.id); } };
+  const dp = $('[data-dup]', r);
+  if (dp) dp.onclick = (e) => { e.stopPropagation(); const t = state.docs.find((x) => x.id === d.dup_of.id); if (t) { navigate(t.folder); if (t.status === 'indexed') openViewer(t.id); } };
   const rv = $('[data-review]', r);
   if (rv) rv.onclick = (e) => { e.stopPropagation(); moveDocDialog(d); };
   r.onclick = (e) => {
@@ -415,6 +457,56 @@ async function renameDoc(d) {
   if (!name || !done) return;
   await refresh({ quiet: true });
 }
+// сроки действия, пересмотр и редакция документа
+async function openTerms(d, onSaved) {
+  const lab = (t, inner) => `<label class="fld" style="display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--fg-muted);margin-bottom:10px">${t}${inner}</label>`;
+  const body = `<div class="set-info"><b>${esc(d.name)}</b></div>` +
+    (d.superseded_by ? `<div class="set-info">Заменён новой редакцией: <b>${esc(d.superseded_by_name || '')}</b>. В поиске он не показывается. <button class="sr-fix-btn" type="button" id="tmUnsup">Вернуть как актуальный</button></div>` : '') +
+    (d.replaces ? `<div class="set-info">Эта редакция заменяет: <b>${esc(d.replaces_name || '')}</b></div>` : '') +
+    lab('Редакция', `<input class="dlg-input" id="tmEd" maxlength="80" placeholder="например, ред. 3 от 12.05.2025" value="${esc(d.edition || '')}">`) +
+    lab('Действует до', `<input class="dlg-input" type="date" id="tmValid" value="${esc(d.valid_until || '')}">`) +
+    lab('Следующий пересмотр до', `<input class="dlg-input" type="date" id="tmReview" value="${esc(d.review_until || '')}">`) +
+    '<p class="jr-note">Пустая дата означает, что срок не задан. За 30 дней до срока файл помечается жёлтым, после срока красным. Такие файлы собираются под значком «сроки» над списком.</p>';
+  const ok = await dialog({
+    title: 'Сроки и редакция', ok: 'Сохранить', bodyHtml: body,
+    onMount: (dlg) => {
+      const u = $('#tmUnsup', dlg);
+      if (u) u.onclick = async () => {
+        try { await api('DELETE', `/api/docs/${d.id}/supersede`); $('[data-x=cancel]', dlg).click(); await refresh({ quiet: true }); toast('Файл снова считается актуальным'); if (onSaved) onSaved(); }
+        catch (e) { toast(e.message, true); }
+      };
+    },
+    validate: async (dlg) => {
+      try { await api('PATCH', `/api/docs/${d.id}`, { edition: $('#tmEd', dlg).value, valid_until: $('#tmValid', dlg).value, review_until: $('#tmReview', dlg).value }); }
+      catch (e) { return e.message; }
+      return null;
+    },
+  });
+  if (ok) { await refresh({ quiet: true }); toast('Сохранено'); if (onSaved) onSaved(); }
+}
+
+// загрузка новой редакции: файл ложится в ту же папку, прежний помечается заменённым (сам не удаляется и не меняется)
+function newEdition(d) {
+  const inp = el('input', { type: 'file', accept: '.pdf,.docx' });
+  inp.onchange = async () => {
+    const f = inp.files[0];
+    if (!f) return;
+    if (!/\.(pdf|docx)$/i.test(f.name)) { toast('Можно загружать только PDF и Word (.docx)', true); return; }
+    const nd = await uploadOne(f, d.folder, false);
+    if (!nd) return;
+    try { await api('POST', `/api/docs/${d.id}/supersede`, { by: nd.id }); } catch (e) { toast(e.message, true); }
+    await refresh({ quiet: true });
+    toast(`«${nd.name}» загружен как новая редакция, прежний файл помечен заменённым`);
+    const fresh = state.docs.find((x) => x.id === nd.id);
+    if (fresh) openTerms(fresh);
+  };
+  dialog({
+    title: 'Новая редакция', ok: 'Выбрать файл…',
+    bodyHtml: `<p style="margin:0;line-height:1.5">Новая редакция для «${esc(d.name)}». Файл ляжет в ту же папку. Прежний файл не удаляется и не меняется: он остаётся доступным, но помечается как заменённый и перестаёт показываться в поиске. Вернуть его в поиск можно переключателем «Показывать заменённые редакции» или кнопкой «Вернуть как актуальный».</p>`,
+    validate: () => { inp.click(); return null; },
+  });
+}
+
 async function deleteDoc(d) {
   const ok = await dialog({ title: 'Удалить файл?', ok: 'Удалить', danger: true, bodyHtml: `«${esc(d.name)}» будет безвозвратно удалён вместе с индексом поиска.` });
   if (!ok) return;
@@ -464,6 +556,30 @@ function wireContentDrop() {
 }
 
 /* ---- загрузка ---- */
+// один файл; если такой уже есть, спрашиваем (загрузить всё равно / показать существующий / не загружать)
+async function uploadOne(f, target, auto) {
+  let keep = false;
+  for (;;) {
+    const fd = new FormData();
+    fd.append('file', f); fd.append('folder', target); fd.append('auto', auto ? '1' : '0');
+    if (keep) fd.append('dup', 'keep');
+    try { return await api('POST', '/api/upload', fd); } catch (e) {
+      if (keep || !(e.data && e.data.duplicate)) { toast(`${f.name}: ${e.message}`, true); return null; }
+      const dup = e.data.duplicate;
+      let showIt = false;
+      const go = await dialog({
+        title: 'Такой файл уже есть', ok: 'Всё равно загрузить', cancel: 'Не загружать',
+        bodyHtml: `<p style="margin:0 0 12px;line-height:1.5">Содержимое «${esc(f.name)}» полностью совпадает с файлом <b>${esc(dup.name)}</b> (${esc(dup.folder_path)}).</p>
+          <button class="btn btn-ghost btn-sm" type="button" id="dupShow">Показать существующий</button>`,
+        onMount: (d) => { $('#dupShow', d).onclick = () => { showIt = true; $('[data-x=cancel]', d).click(); }; },
+      });
+      if (showIt) { navigate(dup.folder); if (dup.status === 'indexed') openViewer(dup.id); return null; }
+      if (!go) return null;
+      keep = true;
+    }
+  }
+}
+
 async function uploadFiles(files, { folder = null } = {}) {
   const pdfs = files.filter((f) => /\.(pdf|docx)$/i.test(f.name));
   if (!pdfs.length) { toast('Можно загружать только PDF и Word (.docx)', true); return; }
@@ -471,11 +587,7 @@ async function uploadFiles(files, { folder = null } = {}) {
   const auto = folder === null && state.auto;
   const target = folder || (state.cur === ROOT ? INBOX : state.cur);
   let ok = 0;
-  for (const f of pdfs) {
-    const fd = new FormData();
-    fd.append('file', f); fd.append('folder', target); fd.append('auto', auto ? '1' : '0');
-    try { await api('POST', '/api/upload', fd); ok++; } catch (e) { toast(`${f.name}: ${e.message}`, true); }
-  }
+  for (const f of pdfs) { if (await uploadOne(f, target, auto)) ok++; }
   if (ok) {
     await refresh({ quiet: true });
     toast(auto ? `Загружено: ${ok}. После распознавания файлы будут разложены по содержанию` :
@@ -486,6 +598,19 @@ async function uploadFiles(files, { folder = null } = {}) {
 /* ---- поиск ---- */
 const searchInput = () => $('#searchInput');
 let searchTimer = null, searchSeq = 0, searchItems = [], searchActive = -1;
+let searchRaw = null;   // запрос, который просили искать «как написано», без исправления опечаток
+
+// переключатель «Показывать заменённые редакции» над выдачей
+function searchOpts() {
+  const box = el('div', { class: 'sr-opts' });
+  const lab = el('label', { class: 'sr-scope' });
+  const cb = el('input', { type: 'checkbox' });
+  cb.checked = store.get('searchOld', false) === true;
+  cb.onchange = () => { store.set('searchOld', cb.checked); searchInput().focus(); if (searchInput().value.trim()) runSearch(); else showHistory(); };
+  lab.appendChild(cb); lab.appendChild(el('span', { text: 'Показывать заменённые редакции' }));
+  box.appendChild(lab);
+  return box;
+}
 
 function wordsOf(q) { return (q.match(/[0-9A-Za-zА-Яа-яЁё]+/g) || []).filter((w) => w.length > 1 || /\d/.test(w)); }
 function highlight(text, q) {
@@ -525,6 +650,7 @@ function showHistory() {
   if (!list.length) { hideResults(); return; }
   ++searchSeq;
   box.innerHTML = ''; searchItems = []; searchActive = -1;
+  box.appendChild(searchOpts());
   box.appendChild(el('div', { class: 'sr-head', text: 'Недавние запросы' }));
   for (const q of list) {
     const row = el('div', { class: 'sr-item sr-hist', role: 'button', tabindex: '-1' },
@@ -547,14 +673,27 @@ async function runSearch() {
   if (!q) { showHistory(); return; }
   const seq = ++searchSeq;
   let data;
-  try { data = await api('GET', '/api/search?q=' + encodeURIComponent(q)); } catch (e) { return; }
+  let url = '/api/search?q=' + encodeURIComponent(q);
+  if (store.get('searchOld', false) === true) url += '&old=1';
+  if (searchRaw === q) url += '&fix=0';
+  try { data = await api('GET', url); } catch (e) { return; }
   if (seq !== searchSeq) return;
+  const qs = data.corrected ? data.corrected.query : q;   // что реально искали: по нему подсвечиваем и открываем документ
   box.innerHTML = ''; searchItems = []; searchActive = -1;
+  box.appendChild(searchOpts());
+  if (data.corrected) {
+    const fx = el('div', { class: 'sr-fix' });
+    fx.appendChild(el('span', {}, (data.corrected.kind === 'layout' ? 'Раскладка исправлена. ' : 'Исправлена опечатка. ') + 'Показаны результаты по «<b>' + esc(qs) + '</b>». '));
+    const raw = el('button', { class: 'sr-fix-btn', type: 'button', text: 'Искать «' + q + '»' });
+    raw.onclick = () => { searchRaw = q; searchInput().focus(); runSearch(); };
+    fx.appendChild(raw);
+    box.appendChild(fx);
+  }
   if (data.folders && data.folders.length) {
     box.appendChild(el('div', { class: 'sr-head', text: 'Папки' }));
     for (const f of data.folders) {
-      const b = el('button', { class: 'sr-item', type: 'button' }, `<div class="sr-top"><span class="fi-icon">${ICON.folder}</span><span class="sr-doc">${highlight(f.name, q)}</span><span class="sr-path">${esc(f.path)} · файлов: ${f.total}</span></div>`);
-      b.onclick = () => { histAdd(q); hideResults(); navigate(f.id); };
+      const b = el('button', { class: 'sr-item', type: 'button' }, `<div class="sr-top"><span class="fi-icon">${ICON.folder}</span><span class="sr-doc">${highlight(f.name, qs)}</span><span class="sr-path">${esc(f.path)} · файлов: ${f.total}</span></div>`);
+      b.onclick = () => { histAdd(qs); hideResults(); navigate(f.id); };
       box.appendChild(b); searchItems.push(b);
     }
   }
@@ -565,13 +704,15 @@ async function runSearch() {
       if (r.kind === 'name') badges.push('<span class="chip chip-ok">по названию</span>');
       if (r.chunk_kind === 'table') badges.push('<span class="chip">таблица</span>');
       if (r.source === 'ocr') badges.push('<span class="chip chip-ocr">скан · OCR</span>');
+      if (r.superseded) badges.push('<span class="chip chip-warn" title="Этот файл заменён новой редакцией">заменён новой редакцией</span>');
+      badges.push(...termChips(r));
       const sec = r.section ? `<span class="sr-sec">п. ${esc(r.section)}</span>` : '';
       const pageTxt = r.page === r.page_to || !r.page_to ? `стр. ${r.page}` : `стр. ${r.page}–${r.page_to}`;
       const b = el('button', { class: 'sr-item', type: 'button' },
-        `<div class="sr-top"><span class="sr-doc">${highlight(r.doc_name, q)}</span><span class="sr-path">${esc(r.folder_path)}</span></div>
+        `<div class="sr-top"><span class="sr-doc">${highlight(r.doc_name, qs)}</span><span class="sr-path">${esc(r.folder_path)}</span></div>
          <div class="sr-meta">${sec}<span>${esc(r.title || '')}</span><span>· ${pageTxt}</span>${badges.join('')}</div>
          ${r.snippet ? `<div class="sr-snip">${r.snippet}</div>` : ''}`);
-      b.onclick = () => { histAdd(q); hideResults(); openViewer(r.doc_id, { q, chunk: r.chunk_id }); };
+      b.onclick = () => { histAdd(qs); hideResults(); openViewer(r.doc_id, { q: qs, chunk: r.chunk_id }); };
       box.appendChild(b); searchItems.push(b);
     }
   }
@@ -587,7 +728,7 @@ function setActiveResult(i) {
 
 function wireSearch() {
   const inp = searchInput();
-  inp.addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(runSearch, 220); });
+  inp.addEventListener('input', () => { searchRaw = null; clearTimeout(searchTimer); searchTimer = setTimeout(runSearch, 220); });
   inp.addEventListener('focus', () => { if (!inp.value.trim()) showHistory(); else if (searchItems.length) $('#searchResults').hidden = false; });
   inp.addEventListener('keydown', (e) => {
     if (e.key === 'ArrowDown') { e.preventDefault(); if (searchItems.length) setActiveResult((searchActive + 1) % searchItems.length); }
@@ -626,6 +767,17 @@ function closeViewer() {
   V = null;
 }
 
+function termBanner(d) {
+  const t = d.term || {}, msgs = [];
+  let bad = false;
+  if (d.superseded_by) { msgs.push(`Документ заменён новой редакцией: <button class="sr-fix-btn" type="button" data-open-new>${esc(d.superseded_by_name || 'открыть')}</button>`); bad = true; }
+  if (t.valid_state === 'expired') { msgs.push(`Срок действия истёк ${fmtDate(d.valid_until)}, проверьте актуальность`); bad = true; }
+  else if (t.valid_state === 'soon') msgs.push(`Действует до ${fmtDate(d.valid_until)}`);
+  if (t.review_state === 'overdue') msgs.push(`Пересмотр просрочен (${fmtDate(d.review_until)})`);
+  else if (t.review_state === 'soon') msgs.push(`Пересмотр до ${fmtDate(d.review_until)}`);
+  return msgs.length ? `<div class="v-banner${bad ? ' bad' : ''}">${msgs.join(' · ')}</div>` : '';
+}
+
 function buildViewer() {
   const d = V.doc;
   const host = $('#viewerHost');
@@ -639,11 +791,13 @@ function buildViewer() {
         <button class="icon-btn" id="vNext" type="button" title="Следующее (Enter, ↓)" aria-label="Следующее совпадение">${ICON.down}</button></div>
       <div class="v-pager"><button class="icon-btn" id="vPgPrev" type="button" aria-label="Предыдущая страница">${ICON.left}</button>
         <span id="vPg"></span><button class="icon-btn" id="vPgNext" type="button" aria-label="Следующая страница">${ICON.right}</button></div>
+      <button class="btn btn-ghost btn-sm" id="vTerms" type="button" title="Сроки действия, пересмотр, редакция">Сроки</button>
       <button class="btn btn-ghost btn-sm" id="vReparse" type="button" title="Распознать документ заново (правки будут потеряны)">Перераспознать</button>
       <a class="btn btn-ghost btn-sm" id="vWord" href="/api/docs/${esc(d.id)}/export.docx" title="Скачать распознанный текст (с вашими правками) в Word">Скачать в Word</a>
       <a class="btn btn-ghost btn-sm" href="${esc(d.url)}" ${d.kind === 'docx' ? 'download' : 'target="_blank" rel="noopener"'}>${d.kind === 'docx' ? 'Оригинал (Word)' : 'Оригинал PDF'}</a>
       <button class="icon-btn" id="vClose" type="button" title="Закрыть (Esc)" aria-label="Закрыть">${ICON.close}</button>
     </div>
+    ${termBanner(d)}
     <div class="v-body">
       <section class="v-pane v-parse"><div class="v-pane-head"><b>Распознанный текст</b><span>чтобы исправить, наведите на абзац и нажмите ✎</span></div>
         <div class="v-scroll" id="vParse"></div></section>
@@ -652,6 +806,9 @@ function buildViewer() {
     </div></div>`;
   $('#vClose').onclick = closeViewer;
   $('#vReparse').onclick = reparseDoc;
+  $('#vTerms').onclick = () => openTerms(d, () => openViewer(d.id, { q: V ? V.q : '' }));
+  const nb = $('[data-open-new]', host);
+  if (nb) nb.onclick = () => openViewer(d.superseded_by);
   wireCopy();
   $('#vPrev').onclick = () => stepHit(-1);
   $('#vNext').onclick = () => stepHit(1);

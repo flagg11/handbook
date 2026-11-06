@@ -117,7 +117,7 @@ button.chip:hover{filter:brightness(.95);}
 .toolbar-info{min-height:22px; font-size:12.5px; color:var(--fg-muted); margin-bottom:8px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;}
 
 .file-table{flex:1; min-height:0; overflow:auto; background:var(--surface); border:1px solid var(--border); border-radius:12px 12px 0 0; border-bottom:0;}
-.file-row{display:grid; grid-template-columns:minmax(0,1fr) 150px 90px 100px 124px; align-items:center; gap:12px; padding:0 14px; min-height:50px; border-bottom:1px solid var(--border);}
+.file-row{display:grid; grid-template-columns:minmax(0,1fr) 150px 90px 100px 180px; align-items:center; gap:12px; padding:0 14px; min-height:50px; border-bottom:1px solid var(--border);}
 .file-row--head{position:sticky; top:0; z-index:2; min-height:38px; background:var(--surface-2); font-size:11.5px; text-transform:uppercase; letter-spacing:.04em; color:var(--fg-faint); font-weight:600;}
 .file-row:not(.file-row--head){cursor:pointer;}
 .file-row:not(.file-row--head):hover{background:var(--surface-2);}
@@ -304,3 +304,14 @@ button.chip:hover{filter:brightness(.95);}
 /* если кегль известен, блок стоит на высоте оригинала - отступы не нужны */
 .sheet .blk.has-fs .ln{margin-bottom:0;}
 .sheet .blk.has-fs .ln.hd{margin:0; font-size:1em;}
+.sr-opts{display:flex; flex-wrap:wrap; gap:4px 18px; padding:7px 10px; border-bottom:1px solid var(--border); margin:-6px -6px 4px; border-radius:12px 12px 0 0;}
+.sr-scope{display:flex; align-items:center; gap:8px; font-size:13px; color:var(--fg-muted); cursor:pointer;}
+.sr-scope input{accent-color:var(--accent);}
+.sr-fix-btn{border:0; background:transparent; color:var(--accent); font-weight:600; padding:0; cursor:pointer;}
+.sr-fix-btn:hover{text-decoration:underline;}
+.jr-note{font-size:12.5px; color:var(--fg-muted); line-height:1.5; margin:8px 0;}
+.file-row.is-old .fr-name,.file-row.is-old .col-type,.file-row.is-old .col-size,.file-row.is-old .col-date{opacity:.55;}
+.v-banner{padding:8px 16px; font-size:13px; background:var(--warn-bg); color:var(--warn-fg); border-bottom:1px solid var(--border);}
+.v-banner.bad{background:var(--bad-bg); color:var(--bad-fg);}
+.v-banner .sr-fix-btn{color:inherit; text-decoration:underline;}
+.sr-fix{padding:8px 10px; margin-bottom:4px; font-size:13px; color:var(--fg-muted); background:var(--accent-soft); border-radius:9px;}
