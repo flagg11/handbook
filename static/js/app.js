@@ -364,6 +364,7 @@ function docRow(d) {
   chips.push(...termChips(d));
   if (d.superseded_by) chips.push(`<button class="chip chip-warn" type="button" data-new title="Открыть актуальную редакцию">заменён: ${esc(d.superseded_by_name || '')}</button>`);
   if (d.replaces) chips.push(`<span class="chip chip-ok" title="Эта редакция заменила предыдущую">заменяет: ${esc(d.replaces_name || '')}</span>`);
+  if (d.editions > 1) chips.push(`<button class="chip" type="button" data-eds title="Показать все редакции этого документа">редакций: ${d.editions}</button>`);
   if (d.dup_of) chips.push(`<button class="chip chip-warn" type="button" data-dup title="Содержимое файла полностью совпадает с другим файлом">дубль: ${esc(d.dup_of.name)}</button>`);
   let status = `${d.pages || '—'} стр.`;
   if (d.status === 'processing' || d.status === 'queued') status = '<span class="spinner"></span> Обработка…';
@@ -380,6 +381,8 @@ function docRow(d) {
     iconBtn(ICON.trash, 'Удалить', () => deleteDoc(d)));
   const nw = $('[data-new]', r);
   if (nw) nw.onclick = (e) => { e.stopPropagation(); const t = state.docs.find((x) => x.id === d.superseded_by); if (t) { navigate(t.folder); if (t.status === 'indexed') openViewer(t.id); } };
+  const eds = $('[data-eds]', r);
+  if (eds) eds.onclick = (e) => { e.stopPropagation(); openEditions(d.id); };
   const dp = $('[data-dup]', r);
   if (dp) dp.onclick = (e) => { e.stopPropagation(); const t = state.docs.find((x) => x.id === d.dup_of.id); if (t) { navigate(t.folder); if (t.status === 'indexed') openViewer(t.id); } };
   const rv = $('[data-review]', r);
@@ -457,6 +460,32 @@ async function renameDoc(d) {
   if (!name || !done) return;
   await refresh({ quiet: true });
 }
+// история редакций: все версии документа, старые первыми; любую можно открыть
+async function openEditions(id) {
+  let data;
+  try { data = await api('GET', `/api/docs/${id}/editions`); } catch (e) { toast(e.message, true); return; }
+  const rows = data.items.map((x, i) => {
+    const chips = [x.superseded_by ? '<span class="chip chip-warn" title="Заменена более новой редакцией">заменена</span>' : '<span class="chip chip-ok" title="Действующая редакция">актуальная</span>'];
+    if (x.id === data.current) chips.push('<span class="chip" title="Эта редакция сейчас открыта или выбрана">выбрана</span>');
+    chips.push(...termChips(x));
+    return `<div class="ed-row${x.id === data.current ? ' cur' : ''}"><div class="ed-n">${i + 1}</div>
+      <div class="ed-main"><div class="ed-name">${esc(x.name)}</div><div class="fr-sub">${chips.join('')}</div>
+      <small>Загружена ${esc(x.date || '')} · ${esc(pathText(x.folder))}</small></div>
+      ${x.status === 'indexed' ? `<button class="btn btn-ghost btn-sm" type="button" data-open="${esc(x.id)}">Открыть</button>` : '<span class="chip">обрабатывается</span>'}</div>`;
+  }).join('');
+  let target = null;
+  await dialog({
+    title: 'Редакции документа', ok: 'Закрыть', cancel: '',
+    bodyHtml: `<p class="jr-note" style="margin-top:0">Старые редакции остаются в хранилище и открываются как обычные файлы, но в поиске по умолчанию скрыты.</p><div class="ed-list">${rows}</div>`,
+    onMount: (dlg) => {
+      dlg.classList.add('wide');
+      const c = $('[data-x=cancel]', dlg); if (c) c.remove();
+      dlg.querySelectorAll('[data-open]').forEach((b) => { b.onclick = () => { target = b.dataset.open; $('[data-x=ok]', dlg).click(); }; });
+    },
+  });
+  if (target) openViewer(target);
+}
+
 // сроки действия, пересмотр и редакция документа
 async function openTerms(d, onSaved) {
   const lab = (t, inner) => `<label class="fld" style="display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--fg-muted);margin-bottom:10px">${t}${inner}</label>`;
@@ -791,6 +820,7 @@ function buildViewer() {
         <button class="icon-btn" id="vNext" type="button" title="Следующее (Enter, ↓)" aria-label="Следующее совпадение">${ICON.down}</button></div>
       <div class="v-pager"><button class="icon-btn" id="vPgPrev" type="button" aria-label="Предыдущая страница">${ICON.left}</button>
         <span id="vPg"></span><button class="icon-btn" id="vPgNext" type="button" aria-label="Следующая страница">${ICON.right}</button></div>
+      ${d.editions > 1 ? `<button class="btn btn-ghost btn-sm" id="vEds" type="button" title="Предыдущие и актуальная редакции этого документа">Редакции: ${d.editions}</button>` : ''}
       <button class="btn btn-ghost btn-sm" id="vTerms" type="button" title="Сроки действия, пересмотр, редакция">Сроки</button>
       <button class="btn btn-ghost btn-sm" id="vReparse" type="button" title="Распознать документ заново (правки будут потеряны)">Перераспознать</button>
       <a class="btn btn-ghost btn-sm" id="vWord" href="/api/docs/${esc(d.id)}/export.docx" title="Скачать распознанный текст (с вашими правками) в Word">Скачать в Word</a>
@@ -807,6 +837,8 @@ function buildViewer() {
   $('#vClose').onclick = closeViewer;
   $('#vReparse').onclick = reparseDoc;
   $('#vTerms').onclick = () => openTerms(d, () => openViewer(d.id, { q: V ? V.q : '' }));
+  const eb = $('#vEds');
+  if (eb) eb.onclick = () => openEditions(d.id);
   const nb = $('[data-open-new]', host);
   if (nb) nb.onclick = () => openViewer(d.superseded_by);
   wireCopy();

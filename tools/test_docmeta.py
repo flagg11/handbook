@@ -103,6 +103,22 @@ check("файл не может заменять сам себя", c.post(f"/api
 c.delete(f"/api/docs/{a}/supersede")
 check("отметку можно снять", c.get("/api/uploads").get_json()[0]["superseded_by"] is None)
 c.post(f"/api/docs/{a}/supersede", json={"by": b})
+
+# история редакций: a -> b -> e
+r5 = upload(raw, "ред3.docx", dup="keep")
+e = r5.get_json()["id"]
+c.post(f"/api/docs/{b}/supersede", json={"by": e})
+for start in (a, b, e):
+    ch = c.get(f"/api/docs/{start}/editions").get_json()
+    ids = [x["id"] for x in ch["items"]]
+    check(f"цепочка редакций видна из любого файла ({start[:6]})", ids == [a, b, e] and ch["current"] == start, str(ids))
+chain = c.get(f"/api/docs/{a}/editions").get_json()["items"]
+check("актуальной помечена только последняя", [bool(x["superseded_by"]) for x in chain] == [True, True, False])
+lst = {d["id"]: d for d in c.get("/api/uploads").get_json()}
+check("у каждого файла цепочки указано число редакций", all(lst[i]["editions"] == 3 for i in (a, b, e)))
+check("у файла вне цепочки редакция одна", all(d["editions"] == 1 for d in lst.values() if d["id"] not in (a, b, e)))
+check("для несуществующего файла - 404", c.get("/api/docs/нет/editions").status_code == 404)
+c.delete(f"/api/upload/{e}")
 c.delete(f"/api/upload/{b}")
 check("если новую редакцию удалили, прежняя снова актуальна", index.get_document(a)["superseded_by"] in (None, ""))
 

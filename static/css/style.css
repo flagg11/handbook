@@ -315,3 +315,12 @@ button.chip:hover{filter:brightness(.95);}
 .v-banner.bad{background:var(--bad-bg); color:var(--bad-fg);}
 .v-banner .sr-fix-btn{color:inherit; text-decoration:underline;}
 .sr-fix{padding:8px 10px; margin-bottom:4px; font-size:13px; color:var(--fg-muted); background:var(--accent-soft); border-radius:9px;}
+.ed-list{display:flex; flex-direction:column; border:1px solid var(--border); border-radius:9px; overflow:hidden; max-height:55vh; overflow-y:auto;}
+.ed-row{display:flex; align-items:center; gap:12px; padding:10px 12px; border-top:1px solid var(--border);}
+.ed-row:first-child{border-top:0;}
+.ed-row.cur{background:var(--accent-soft);}
+.ed-n{flex:none; width:24px; height:24px; border-radius:50%; background:var(--surface-3); color:var(--fg-muted); font-size:12px; font-weight:600; display:flex; align-items:center; justify-content:center;}
+.ed-main{flex:1; min-width:0;}
+.ed-name{font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.ed-main small{display:block; margin-top:3px; color:var(--fg-faint); font-size:11.5px;}
+

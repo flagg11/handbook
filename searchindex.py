@@ -298,7 +298,54 @@ def relations():
                 first[r["sha256"]] = r
         if r["superseded_by"]:
             replaces[r["superseded_by"]] = r["id"]
-    return {"dup": dup, "replaces": replaces, "names": {r["id"]: r["name"] for r in rows}}
+    # сколько редакций у документа: файлы, связанные цепочкой замен, считаются одним документом
+    parent = {r["id"]: r["id"] for r in rows}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for r in rows:
+        if r["superseded_by"] and r["superseded_by"] in parent:
+            parent[find(r["id"])] = find(r["superseded_by"])
+    sizes = {}
+    for i in parent:
+        sizes[find(i)] = sizes.get(find(i), 0) + 1
+    return {"dup": dup, "replaces": replaces, "names": {r["id"]: r["name"] for r in rows},
+            "group": {i: sizes[find(i)] for i in parent}}
+
+
+def edition_chain(doc_id):
+    """все редакции документа, к которому относится doc_id: старые первыми, актуальная последней"""
+    with connect() as con:
+        rows = [dict(r) for r in con.execute("SELECT * FROM docs ORDER BY uploaded_at, rowid")]
+    by_id = {r["id"]: r for r in rows}
+    if doc_id not in by_id:
+        return []
+    adj = {}
+    for r in rows:
+        nxt = r.get("superseded_by")
+        if nxt and nxt in by_id:
+            adj.setdefault(r["id"], set()).add(nxt)
+            adj.setdefault(nxt, set()).add(r["id"])
+    seen, stack = {doc_id}, [doc_id]
+    while stack:
+        for y in adj.get(stack.pop(), ()):
+            if y not in seen:
+                seen.add(y)
+                stack.append(y)
+
+    def steps_to_current(x):  # сколько замен отделяет файл от актуальной редакции
+        n, guard = 0, 0
+        while by_id[x].get("superseded_by") in by_id and guard < 1000:
+            x, n, guard = by_id[x]["superseded_by"], n + 1, guard + 1
+        return n
+
+    items = [r for r in rows if r["id"] in seen]
+    items.sort(key=lambda r: -steps_to_current(r["id"]))  # при равенстве остаётся порядок загрузки
+    return items
 
 
 def _clean_date(value):

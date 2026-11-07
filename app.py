@@ -109,7 +109,7 @@ def doc_to_json(d, rel=None):
         "term": index.term_state(d),
         "superseded_by": sup_by, "superseded_by_name": rel["names"].get(sup_by) if sup_by else None,
         "replaces": old_id, "replaces_name": rel["names"].get(old_id) if old_id else None,
-        "dup_of": rel["dup"].get(d["id"]),
+        "dup_of": rel["dup"].get(d["id"]), "editions": rel["group"].get(d["id"], 1),
         "id": d["id"], "folder": d["folder"], "name": d["name"],
         "size": human_size(d["size_bytes"]), "date": d["date_label"], "author": d["author"],
         "status": d["status"], "pages": d["pages"], "ocr_pages": d["ocr_pages"], "tables": d["tables"],
@@ -439,6 +439,16 @@ def doc_update(doc_id):
     except (ValueError, LookupError) as exc:
         return _error(str(exc))
     return jsonify(doc_to_json(index.get_document(doc_id)))
+
+
+@app.route("/api/docs/<doc_id>/editions")
+def doc_editions(doc_id):
+    """все редакции документа: старые первыми, актуальная последней"""
+    chain = index.edition_chain(doc_id)
+    if not chain:
+        return _error("Файл не найден", 404)
+    rel = index.relations()
+    return jsonify({"current": doc_id, "items": [doc_to_json(d, rel) for d in chain]})
 
 
 @app.route("/api/docs/<doc_id>/supersede", methods=["POST"])
