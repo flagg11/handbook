@@ -188,6 +188,10 @@ button.chip:hover{filter:brightness(.95);}
 /* левая панель: листы того же размера, что и справа */
 .v-parse .v-scroll{padding:16px; background:var(--surface-3);}
 #vParse .sheet{font-family:"Times New Roman","Liberation Serif","PT Serif",Times,serif; font-size:max(9px, calc(var(--sw, var(--pw, 700px)) * .02353)); line-height:1.17; padding:calc(var(--pw, 700px) * .045) calc(var(--pw, 700px) * .06) calc(var(--pw, 700px) * .04) calc(var(--pw, 700px) * .085); box-sizing:border-box; color:var(--fg);}
+/* лист с распознанным текстом всегда белый, поэтому внутри него светлая палитра, даже если тема страницы тёмная */
+#vParse .sheet{color-scheme:light; --surface:#FFFFFF; --surface-2:#EAEFF8; --surface-3:#E1E7F2; --border:#DBE2EE;
+  --fg:#151A23; --fg-muted:#5F6A7E; --fg-faint:#8791A3; --accent:#2450C7; --accent-hover:#1D42AC; --accent-fg:#FFFFFF; --accent-soft:#E4ECFD;
+  --warn-bg:#FBEED2; --warn-fg:#8A5A11; --ok-bg:#DDF3E8; --ok-fg:#1F7A4D; --bad-bg:#FBE3E1; --bad-fg:#B3261E; --mark:#FFE066; --mark-cur:#FF9F43; color:var(--fg);}
 .pages.sheets .sheet{display:block;}
 .sheet .pg-num{font-size:11px; line-height:1;}
 .pg-empty{position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:var(--fg-faint); font-size:13px; pointer-events:none;}
